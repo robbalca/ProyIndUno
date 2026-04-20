@@ -1,111 +1,143 @@
-from fastapi import FastAPI
-from typing import Union
-import unicodedata as unicodedata
-from pandas import read_csv
+
 import pandas as pd
-
-
+from fastapi import FastAPI, HTTPException
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
 
 app = FastAPI()
 
-
-
-d1 = pd.read_csv('d_limpio.csv')
-
 @app.get("/")
-def read_root():
-    return {"Escribe lo que desees"}
+def home():
+    return {"status": "Servidor funcionando correctamente"}
+
+# 1. CARGA DE DATOS GLOBAL OPTIMIZADA
+# Solo cargamos las columnas que usan las 7 funciones
+columnas_uso = ['title', 'popularity', 'overview', 'genres', 'release_year', 'vote_average', 'return', 'budget', 'revenue']
+
+# Cargamos solo 15,000 para que las funciones 1 a 6 tengan datos, pero sin saturar la RAM
+d1 = pd.read_csv('d_limpio.csv', usecols=columnas_uso, nrows=15000)
+
+# 2. OPTIMIZACIÓN ML (Función 7)
+# Usamos las 5000 más populares de esas 15,000
+df_ml = d1.sort_values('popularity', ascending=False).head(5000).copy()
+df_ml['combined'] = df_ml['overview'].fillna('') + " " + df_ml['genres'].fillna('')
+
+tfidf = TfidfVectorizer(stop_words='english')
+tfidf_matrix = tfidf.fit_transform(df_ml['combined'])
+
+# Usamos float32 para reducir el peso de la matriz a la mitad
+cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix).astype('float32')
+
+indices = pd.Series(df_ml.index, index=df_ml['title'].str.lower()).drop_duplicates()
 
 
-@app.get('/peliculas_mes/{mes}')
-def peliculas_mes(mes:str) -> dict:
-    '''Se ingresa el mes y la funcion retorna la cantidad de peliculas que se   estrenaron ese mes historicamente'''
+
+# --- FUNCIONES 1 a 6 (Consultas sobre el d1 completo) ---
+# 1. Cantidad de películas por país y año
+@app.get('/get_country/{year}/{country}')
+def get_country(year: int, country: str):
+    # Filtramos por año y buscamos el país en la columna de texto
+    mask = (d1['release_year'] == year) & (d1['production_countries'].str.contains(country, case=False, na=False))
+    cantidad = int(len(d1[mask]))
+    return {
+        "pais": country, 
+        "anio": year, 
+        "cantidad_peliculas": cantidad
+    }
+
+# 2. Recaudación por productora y año
+@app.get('/get_company_revenue/{company}/{year}')
+def get_company_revenue(company: str, year: int):
+    # Filtramos por año y buscamos la productora (insensible a mayúsculas)
+    mask = (d1['release_year'] == year) & (d1['production_companies'].str.contains(company, case=False, na=False))
     
-    months_translated= {
-    'enero': 'January',
-    'febrero': 'Febreary',
-    'marzo': 'March',
-    'abril': 'April',
-    'mayo': 'May',
-    'junio': 'June',
-    'julio': 'July',
-    'agosto': 'August',
-    'septiembre': 'September',
-    'octubre': 'October',
-    'noviembre': 'November',
-    'diciembre': 'December'}
-    fechas = pd.to_datetime(d1['release_date'], format= '%Y-%m-%d')
-    n_mes= fechas[fechas.dt.month_name(locale = 'es')==mes.capitalize()]
-    respuesta = n_mes.shape[0]
-    return {'mes':mes, 'cantidad':respuesta}
+    # Sumamos la columna revenue de las filas que cumplen el criterio
+    total_revenue = int(d1[mask]['revenue'].sum())
+    
+    return {
+        "productora": company,
+        "anio": year,
+        "recaudacion_total": total_revenue
+    }
+
+# 3. Cantidad de películas por año
+@app.get('/get_count_movies/{year}')
+def get_count_movies(year: int):
+    # Filtramos por el año y contamos las filas
+    cantidad = int(len(d1[d1['release_year'] == year]))
+    
+    return {
+        "anio": year,
+        "total_peliculas": cantidad
+    }
+
+# 4. Película con mayor retorno en un año específico
+@app.get('/get_return/{year}')
+def get_return(year: int):
+    # Filtramos por año
+    df_year = d1[d1['release_year'] == year]
+    
+    if df_year.empty:
+        return "No hay datos para ese año"
+    
+    # Buscamos la fila con el valor máximo en la columna 'return'
+    pelicula_mayor_retorno = df_year.loc[df_year['return'].idxmax(), 'title']
+    
+    return pelicula_mayor_retorno
+
+# 5. Película con el menor presupuesto en un año específico
+@app.get('/get_min_budget/{year}')
+def get_min_budget(year: int):
+    # Filtramos por año y nos aseguramos de que el presupuesto sea mayor a 0 
+    # (para evitar contar películas sin datos de presupuesto cargados)
+    df_year = d1[(d1['release_year'] == year) & (d1['budget'] > 0)]
+    
+    if df_year.empty:
+        return {"mensaje": "No hay datos de presupuesto para ese año"}
+    
+    # Obtenemos la fila con el presupuesto mínimo
+    row = df_year.loc[df_year['budget'].idxmin()]
+    
+    return {
+        'title': str(row['title']),
+        'year': int(row['release_year']),
+        'budget': float(row['budget'])
+    }
+
+# 6. Top 5 franquicias con mayor recaudación histórica
+@app.get('/get_collection_revenue')
+def get_collection_revenue():
+    # Eliminamos las filas que no pertenecen a ninguna colección
+    df_collections = d1.dropna(subset=['belongs_to_collection'])
+    
+    # Agrupamos por colección y sumamos la recaudación (revenue)
+    top_5 = df_collections.groupby('belongs_to_collection')['revenue'].sum().sort_values(ascending=False).head(5)
+    
+    # Devolvemos solo la lista de nombres (el índice del grupo)
+    return list(top_5.index)
+
+
+# --- FUNCIÓN 7: SISTEMA DE RECOMENDACIÓN ---
+@app.get('/get_recommendation/{titulo}')
+def get_recommendation(titulo: str):
+    titulo = titulo.lower()
+    if titulo not in indices:
+        return {"error": "Película no encontrada en el top de popularidad"}
+    
+    idx = indices[titulo]
+    if isinstance(idx, pd.Series): idx = idx.iloc[0]
+
+    sim_scores = list(enumerate(cosine_sim[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+    sim_scores = sim_scores[1:6]
+
+    movie_indices = [i[0] for i in sim_scores]
+    return {'recomendaciones': df_ml['title'].iloc[movie_indices].tolist()}
 
     
-
-@app.get('/peliculas_dia/{dia}')
-def peliculas_dia(dia:str) -> dict:
-    '''Se ingresa el dia y la funcion retorna la cantidad de peliculas que se   estrebaron ese dia historicamente'''
-    
-    day_translated = {
-    'lunes': 'Monday',
-    'martes': 'Tuesday',
-    'miercoles': 'Wednesday',
-    'jueves': 'Thursday',
-    'viernes': 'Friday',
-    'sabado': 'Saturday',
-    'domingo': 'Sunday'}
-    fechas = pd.to_datetime(d1['release_date'], format= '%Y-%m-%d')
-    n_dia= fechas[fechas.dt.day_name(locale = 'es')==dia.capitalize()]
-    respuesta = n_dia.shape[0]
-    return {'dia':dia, 'cantidad':respuesta}
-
+   
     
 
-@app.get('/franquicia/{franquicia}')
-def franquicia(franquicia:str):
-    '''Se ingresa la franquicia, retornando la cantidad de peliculas, ganancia total  y promedio'''
-    f_bajo= franquicia.lower()
-    fran= d1[['belongs_to_collection','budget','revenue']].dropna(subset=['belongs_to_collection'])
-    fran= fran[fran['belongs_to_collection'].map(str.lower).apply(lambda x: f_bajo in x)]
-    cantidad = fran.shape[0]
-    gananciat= (fran['revenue']- fran['budget']).sum()
-    gananciap= (fran['revenue']- fran['budget']).mean()
-    return {'franquicia': franquicia, 'cantidad': cantidad, 'ganancia_total':gananciat, 'ganancia_promedio': gananciap}
 
 
     
-
-@app.get('/peliculas_pais/{pais}')
-def peliculas_pais(pais:str):
-    '''Ingresas el pais, retornando la cantidad de peliculas producidas en el mismo'''
-    if isinstance(pais, str):
-        p_bajo = pais.lower()
-        cantidad = d['production_countries'].apply(lambda x: str(x).lower()).map(str.lower).apply(lambda x: p_bajo in x).sum()
-        return {'pais': pais, 'cantidad': cantidad}
-
-    
-
-@app.get('/productoras/{productora}')
-def productoras(productora:str):
-    '''Ingresas la productora, retornando la ganancia toal y la cantidad de peliculas que produjeron'''
-    prod = d1[['production_companies','budget', 'revenue']].dropna()
-    prod['production_companies'] = prod['production_companies'].map(str.lower)
-    cantidad = prod.shape[0]
-    gtotal= (prod['revenue'] - prod['budget']).sum()
-    return {'productora':productora, 'ganancia_total': gtotal, 'cantidad': cantidad }
-
-    
-@app.get('/retorno/{pelicula}')
-def retorno(pelicula:str) -> dict:
-    '''Ingresas la pelicula, retornando la inversion, la ganancia, el retorno y el año en el que se lanzo'''
-    pelicula_df = d1.loc[d1['title'] == pelicula.title()]
-    inversion = pelicula_df['budget'].iloc[0].item()
-    ganancia = pelicula_df['revenue'].iloc[0].item()
-    retorno= pelicula_df['return'].iloc[0].item()
-    anio = pelicula_df['release_year'].iloc[0].item()
-    return {'pelicula': pelicula, 'inversion': inversion, 'ganancia': ganancia, 'retorno': retorno, 'anio': anio }
-
-    
-# ML
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: Union[str, None] = None):
-    return {"item_id": item_id, "q": q}
